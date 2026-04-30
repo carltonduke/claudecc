@@ -1,0 +1,33 @@
+modLoader="javafml"
+loaderVersion="[47,48)"
+license="MIT"
+
+[[mods]]
+modId="claudecc"
+version="1.0.0"
+displayName="CC: Claude"
+description='''
+Adds an interactive Claude AI chat shell to CC: Tweaked computers.
+Run /claudecc api <key> as an operator, then run the 'claude' program on any computer.
+'''
+
+[[dependencies.claudecc]]
+    modId="computercraft"
+    mandatory=true
+    versionRange="[1.0,)"
+    ordering="AFTER"
+    side="BOTH"
+
+[[dependencies.claudecc]]
+    modId="forge"
+    mandatory=true
+    versionRange="[47,48)"
+    ordering="NONE"
+    side="BOTH"
+
+[[dependencies.claudecc]]
+    modId="minecraft"
+    mandatory=true
+    versionRange="[1.20.1,1.21)"
+    ordering="NONE"
+    side="BOTH"

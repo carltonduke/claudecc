@@ -1,0 +1,20 @@
+{
+    "schemaVersion": 1,
+    "id": "claudecc",
+    "version": "1.0.0",
+    "name": "CC: Claude",
+    "description": "Adds an interactive Claude AI chat shell to CC: Tweaked computers.",
+    "authors": ["Carlton Duke"],
+    "environment": "*",
+    "entrypoints": {
+        "main": [
+            "dev.carlt.claudecc.fabric.ClaudeCCFabric"
+        ]
+    },
+    "depends": {
+        "fabricloader": ">=0.14.21",
+        "fabric-api": ">=0.86.1",
+        "minecraft": "=1.20.1",
+        "computercraft": "*"
+    }
+}
