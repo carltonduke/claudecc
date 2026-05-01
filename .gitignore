@@ -1,5 +1,8 @@
-.gradle/
 fabric/bin/
 fabric/build/
 forge/bin/
 forge/build/
+forge/run/
+build/
+forge/.eclipse/
+.*/
