@@ -38,3 +38,12 @@
 ./gradlew forge:build
 ./gradlew fabric:build
 ```
+
+## ToDo
+
+- run files
+- connect peripherals
+- after sending a chat, immediately clear my command line before sending the api request
+- rerender your whole previous chat
+- pastebin skill
+- history
