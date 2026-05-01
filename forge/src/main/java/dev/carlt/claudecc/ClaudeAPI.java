@@ -76,7 +76,8 @@ public class ClaudeAPI implements ILuaAPI {
 
         var bodyBuilder = new StringBuilder();
         bodyBuilder.append("{\"model\":\"").append(MODEL)
-            .append("\",\"max_tokens\":").append(MAX_TOKENS)
+            .append("\",\"stream\":true")
+            .append(",\"max_tokens\":").append(MAX_TOKENS)
             .append(",\"messages\":").append(messagesJson);
         if (toolsJson != null) {
             bodyBuilder.append(",\"tools\":").append(toolsJson);
@@ -91,45 +92,70 @@ public class ClaudeAPI implements ILuaAPI {
             .POST(HttpRequest.BodyPublishers.ofString(bodyBuilder.toString()))
             .build();
 
-        HTTP_CLIENT.sendAsync(request, HttpResponse.BodyHandlers.ofString()).whenComplete((response, err) -> {
-            if (err != null) {
+        HTTP_CLIENT.sendAsync(request, HttpResponse.BodyHandlers.ofLines())
+            .thenAccept(response -> {
+                if (response.statusCode() != 200) {
+                    var body = response.body()
+                        .collect(java.util.stream.Collectors.joining());
+                    computer.queueEvent("claude_error",
+                        "API returned status " + response.statusCode() + ": " + extractError(body));
+                    return;
+                }
+                processStream(response.body());
+            })
+            .exceptionally(err -> {
                 computer.queueEvent("claude_error", err.getMessage());
-                return;
-            }
-            if (response.statusCode() != 200) {
-                computer.queueEvent("claude_error", "API returned status " + response.statusCode() + ": " + extractError(response.body()));
-                return;
-            }
+                return null;
+            });
+    }
+
+    private void processStream(java.util.stream.Stream<String> lines) {
+        var fullText   = new StringBuilder();
+        var toolId     = new String[]{null};
+        var toolName   = new String[]{null};
+        var toolInput  = new StringBuilder();
+        var stopReason = new String[]{"end_turn"};
+
+        lines.forEach(line -> {
+            if (!line.startsWith("data: ")) return;
+            var data = line.substring(6).trim();
+            if (data.isEmpty()) return;
             try {
-                var json = JsonParser.parseString(response.body()).getAsJsonObject();
-                var stopReason = json.get("stop_reason").getAsString();
-                var contentArray = json.getAsJsonArray("content");
-
-                var textBuilder = new StringBuilder();
-                String toolUseId = null, toolUseName = null, toolUseInput = null;
-
-                for (var element : contentArray) {
-                    var item = element.getAsJsonObject();
-                    var type = item.get("type").getAsString();
-                    if ("text".equals(type)) {
-                        textBuilder.append(item.get("text").getAsString());
-                    } else if ("tool_use".equals(type) && toolUseId == null) {
-                        toolUseId = item.get("id").getAsString();
-                        toolUseName = item.get("name").getAsString();
-                        toolUseInput = item.get("input").toString();
+                var json = JsonParser.parseString(data).getAsJsonObject();
+                switch (json.get("type").getAsString()) {
+                    case "content_block_start" -> {
+                        var block = json.getAsJsonObject("content_block");
+                        if ("tool_use".equals(block.get("type").getAsString())) {
+                            toolId[0]   = block.get("id").getAsString();
+                            toolName[0] = block.get("name").getAsString();
+                        }
+                    }
+                    case "content_block_delta" -> {
+                        var delta     = json.getAsJsonObject("delta");
+                        var deltaType = delta.get("type").getAsString();
+                        if ("text_delta".equals(deltaType)) {
+                            var text = delta.get("text").getAsString();
+                            fullText.append(text);
+                            if (!text.isEmpty()) computer.queueEvent("claude_chunk", text);
+                        } else if ("input_json_delta".equals(deltaType)) {
+                            toolInput.append(delta.get("partial_json").getAsString());
+                        }
+                    }
+                    case "message_delta" -> {
+                        var d = json.getAsJsonObject("delta");
+                        if (d.has("stop_reason") && !d.get("stop_reason").isJsonNull())
+                            stopReason[0] = d.get("stop_reason").getAsString();
                     }
                 }
-
-                if ("tool_use".equals(stopReason) && toolUseId != null) {
-                    computer.queueEvent("claude_tool_use",
-                        textBuilder.toString(), toolUseId, toolUseName, toolUseInput);
-                } else {
-                    computer.queueEvent("claude_response", textBuilder.toString());
-                }
-            } catch (Exception e) {
-                computer.queueEvent("claude_error", "Failed to parse response: " + e.getMessage());
-            }
+            } catch (Exception ignored) {}
         });
+
+        if ("tool_use".equals(stopReason[0]) && toolId[0] != null) {
+            computer.queueEvent("claude_tool_use",
+                fullText.toString(), toolId[0], toolName[0], toolInput.toString());
+        } else {
+            computer.queueEvent("claude_response", fullText.toString());
+        }
     }
 
     /**

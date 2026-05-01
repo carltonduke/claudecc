@@ -35,7 +35,7 @@ local C = {
 -- Each entry is a list of {text, colour} segments forming one screen line.
 local lineBuf   = {}
 local scrollOff = 0  -- 0 = bottom; N = scrolled up N lines
-local selA, selB = nil, nil  -- selected buffer-line range (inclusive)
+local selA, selB = nil, nil  -- {bufLineIdx, charOffset} pairs, or nil
 
 local function clampScroll()
     local maxOff = math.max(0, #lineBuf - CHAT_HEIGHT)
@@ -57,13 +57,14 @@ end
 -- Return the text of the current selection as a newline-joined string.
 local function getSelectedText()
     if not selA or not selB then return "" end
-    local a, b = math.min(selA, selB), math.max(selA, selB)
+    local a, b = selA, selB
+    if a[1] > b[1] or (a[1] == b[1] and a[2] > b[2]) then a, b = b, a end
     local parts = {}
-    for i = a, b do
-        local line = lineBuf[i]
-        local t = ""
-        if line then for _, seg in ipairs(line) do t = t .. seg[1] end end
-        table.insert(parts, t)
+    for i = a[1], b[1] do
+        local t  = lineText(i)
+        local lo = (i == a[1]) and a[2] + 1 or 1   -- Lua 1-indexed
+        local hi = (i == b[1]) and b[2] + 1 or #t
+        parts[#parts+1] = t:sub(lo, hi)
     end
     return table.concat(parts, "\n")
 end
@@ -73,6 +74,14 @@ local function bufLine(segments)
     table.insert(lineBuf, segments)
 end
 
+-- Return the plain text of lineBuf[i] (all segment texts concatenated).
+local function lineText(i)
+    if not lineBuf[i] then return "" end
+    local t = {}
+    for _, seg in ipairs(lineBuf[i]) do t[#t+1] = seg[1] end
+    return table.concat(t)
+end
+
 -- Render the chat viewport.
 local function renderChat()
     clampScroll()
@@ -80,23 +89,43 @@ local function renderChat()
     local bottom = total - scrollOff
     local top    = math.max(1, bottom - CHAT_HEIGHT + 1)
 
-    local selLow  = selA and selB and math.min(selA, selB)
-    local selHigh = selA and selB and math.max(selA, selB)
+    local selNorm = nil
+    if selA and selB then
+        local a, b = selA, selB
+        if a[1] > b[1] or (a[1] == b[1] and a[2] > b[2]) then a, b = b, a end
+        selNorm = {a = a, b = b}
+    end
 
     for row = 1, CHAT_HEIGHT do
-        local li       = top + row - 1
-        local selected = selLow and li >= 1 and li <= total and li >= selLow and li <= selHigh
-        if selected then bg(colours.grey) else bg(colours.black) end
+        local li = top + row - 1
+        bg(colours.black)
         term.setCursorPos(1, HEADER_ROWS + row)
         term.clearLine()
         if li >= 1 and li <= total then
-            for _, seg in ipairs(lineBuf[li]) do
-                col(seg[2])
-                term.write(seg[1])
+            local fromCh, toCh = nil, nil
+            if selNorm and li >= selNorm.a[1] and li <= selNorm.b[1] then
+                fromCh = (li == selNorm.a[1]) and selNorm.a[2] or 0
+                toCh   = (li == selNorm.b[1]) and selNorm.b[2] or (w + 1)
             end
+            local cp = 0
+            for _, seg in ipairs(lineBuf[li]) do
+                local txt, clr = seg[1], seg[2]
+                if fromCh then
+                    for ci = 1, #txt do
+                        local c = cp + ci - 1
+                        bg(c >= fromCh and c <= toCh and colours.grey or colours.black)
+                        col(clr)
+                        term.write(txt:sub(ci, ci))
+                    end
+                else
+                    col(clr)
+                    term.write(txt)
+                end
+                cp = cp + #txt
+            end
+            bg(colours.black)
         end
     end
-    bg(colours.black)
 
     -- Scroll indicator
     if scrollOff > 0 then
@@ -366,15 +395,49 @@ end
 -- ─── Agentic loop ────────────────────────────────────────────────────────────
 local history = {}
 
+-- Push plain (non-markdown) text into lineBuf, respecting newlines and word-wrap.
+local function pushPlainText(text)
+    local pos, len = 1, #text
+    local first = true
+    while pos <= len do
+        local nl   = text:find("\n", pos, true)
+        local line = nl and text:sub(pos, nl - 1) or text:sub(pos)
+        if not first then bufLine({}) end
+        first = false
+        if #line > 0 then pushSegments({{line, C.white}}) end
+        pos = nl and nl + 1 or len + 1
+    end
+    if first then bufLine({}) end
+end
+
 local function agentChat(userInput)
     table.insert(history, {role = "user", content = userInput})
     claudecc.ask(textutils.serialiseJSON(history), TOOLS_JSON)
 
+    local streamStart = nil  -- lineBuf index where the streaming response begins
+    local streamBuf   = ""   -- accumulated text received via claude_chunk
+
+    local function finishStream()
+        if streamStart then
+            while #lineBuf >= streamStart do table.remove(lineBuf) end
+            streamStart, streamBuf = nil, ""
+        end
+    end
+
     while true do
         local ev, a, b, c, d = os.pullEvent()
 
-        if ev == "claude_response" then
-            -- a = response text
+        if ev == "claude_chunk" then
+            -- a = incremental text delta from the streaming API
+            if not streamStart then streamStart = #lineBuf + 1 end
+            streamBuf = streamBuf .. a
+            while #lineBuf >= streamStart do table.remove(lineBuf) end
+            pushPlainText(streamBuf)
+            newContent()
+
+        elseif ev == "claude_response" then
+            -- a = full response text (sent after all chunks)
+            finishStream()
             if a and a ~= "" then
                 pushMarkdown(a)
                 table.insert(history, {role = "assistant", content = a})
@@ -384,6 +447,7 @@ local function agentChat(userInput)
 
         elseif ev == "claude_tool_use" then
             -- a=textBefore, b=toolId, c=toolName, d=inputJson
+            finishStream()
             local textBefore, toolId, toolName, inputJson = a, b, c, d
             local input = textutils.unserialiseJSON(inputJson) or {}
 
@@ -413,8 +477,10 @@ local function agentChat(userInput)
             newContent()
 
             claudecc.ask(textutils.serialiseJSON(history), TOOLS_JSON)
+            streamStart, streamBuf = nil, ""
 
         elseif ev == "claude_error" then
+            finishStream()
             pushLine("Error: " .. tostring(a), C.red)
             newContent()
             return false
@@ -425,22 +491,32 @@ end
 -- ─── Custom readline (supports scroll, mouse selection, copy/paste) ──────────
 local function readline()
     local buf      = ""
-    local pos      = 1  -- 1-indexed insert position
-    local ctrlHeld = false
+    local pos         = 1  -- 1-indexed insert position
+    local inputScroll = 0  -- chars scrolled off the left of the input view
+    local ctrlHeld    = false
+
+    local function clampInputScroll()
+        local visibleW = w - 2
+        if pos <= inputScroll then
+            inputScroll = pos - 1
+        elseif pos > inputScroll + visibleW then
+            inputScroll = pos - visibleW
+        end
+    end
 
     local function redrawInput()
         term.setCursorPos(3, INPUT_ROW)
         col(C.white)
         local visible = buf .. " "
-        term.write(visible:sub(1, w - 2))
-        term.setCursorPos(2 + pos, INPUT_ROW)
+        term.write(visible:sub(inputScroll + 1, inputScroll + (w - 2)))
+        term.setCursorPos(2 + (pos - inputScroll), INPUT_ROW)
     end
 
     local function clearSel()
         if selA then
             selA, selB = nil, nil
             renderChat()
-            term.setCursorPos(2 + pos, INPUT_ROW)
+            term.setCursorPos(2 + (pos - inputScroll), INPUT_ROW)
         end
     end
 
@@ -460,12 +536,14 @@ local function readline()
             clearSel()
             buf = buf:sub(1, pos - 1) .. p1 .. buf:sub(pos)
             pos = pos + 1
+            clampInputScroll()
             redrawInput()
 
         elseif ev == "paste" then
             -- p1 = pasted text (Ctrl+V in the terminal window)
             buf = buf:sub(1, pos - 1) .. p1 .. buf:sub(pos)
             pos = pos + #p1
+            clampInputScroll()
             redrawInput()
 
         elseif ev == "key" then
@@ -482,37 +560,43 @@ local function readline()
             elseif p1 == keys.backspace and pos > 1 then
                 buf = buf:sub(1, pos - 2) .. buf:sub(pos)
                 pos = pos - 1
+                clampInputScroll()
                 redrawInput()
 
             elseif p1 == keys.delete and pos <= #buf then
                 buf = buf:sub(1, pos - 1) .. buf:sub(pos + 1)
+                clampInputScroll()
                 redrawInput()
 
             elseif p1 == keys.left and pos > 1 then
                 pos = pos - 1
-                term.setCursorPos(2 + pos, INPUT_ROW)
+                clampInputScroll()
+                redrawInput()
 
             elseif p1 == keys.right and pos <= #buf then
                 pos = pos + 1
-                term.setCursorPos(2 + pos, INPUT_ROW)
+                clampInputScroll()
+                redrawInput()
 
             elseif p1 == keys.home then
                 pos = 1
-                term.setCursorPos(2 + pos, INPUT_ROW)
+                clampInputScroll()
+                redrawInput()
 
             elseif p1 == keys["end"] then
                 pos = #buf + 1
-                term.setCursorPos(2 + pos, INPUT_ROW)
+                clampInputScroll()
+                redrawInput()
 
             elseif p1 == keys.pageUp then
                 scrollOff = math.min(scrollOff + CHAT_HEIGHT, math.max(0, #lineBuf - CHAT_HEIGHT))
                 renderChat()
-                term.setCursorPos(2 + pos, INPUT_ROW)
+                term.setCursorPos(2 + (pos - inputScroll), INPUT_ROW)
 
             elseif p1 == keys.pageDown then
                 scrollOff = math.max(0, scrollOff - CHAT_HEIGHT)
                 renderChat()
-                term.setCursorPos(2 + pos, INPUT_ROW)
+                term.setCursorPos(2 + (pos - inputScroll), INPUT_ROW)
             end
 
         elseif ev == "key_up" then
@@ -525,9 +609,12 @@ local function readline()
             if p1 == 1 then
                 local li = screenRowToBufLine(p3)
                 if li then
-                    selA, selB = li, li
+                    local t = lineText(li)
+                    local ch = math.max(0, math.min(p2 - 1, math.max(0, #t - 1)))
+                    selA = {li, ch}
+                    selB = {li, ch}
                     renderChat()
-                    term.setCursorPos(2 + pos, INPUT_ROW)
+                    term.setCursorPos(2 + (pos - inputScroll), INPUT_ROW)
                 else
                     clearSel()
                 end
@@ -538,9 +625,11 @@ local function readline()
             if p1 == 1 and selA then
                 local li = screenRowToBufLine(p3)
                 if li then
-                    selB = li
+                    local t = lineText(li)
+                    local ch = math.max(0, math.min(p2 - 1, math.max(0, #t - 1)))
+                    selB = {li, ch}
                     renderChat()
-                    term.setCursorPos(2 + pos, INPUT_ROW)
+                    term.setCursorPos(2 + (pos - inputScroll), INPUT_ROW)
                 end
             end
 
@@ -548,7 +637,7 @@ local function readline()
             -- p1: -1 = up (show older), 1 = down (show newer)
             scrollOff = math.max(0, math.min(scrollOff - p1, math.max(0, #lineBuf - CHAT_HEIGHT)))
             renderChat()
-            term.setCursorPos(2 + pos, INPUT_ROW)
+            term.setCursorPos(2 + (pos - inputScroll), INPUT_ROW)
         end
     end
 end
