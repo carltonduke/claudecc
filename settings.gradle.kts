@@ -6,5 +6,5 @@ pluginManagement {
     }
 }
 
-rootProject.name = "claudecc-addon"
+rootProject.name = "claudecc"
 include("forge", "fabric")
