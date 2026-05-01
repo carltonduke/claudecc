@@ -1,10 +1,11 @@
 plugins {
-    id("net.minecraftforge.gradle") version "[6.0,6.2)"
+    id("net.neoforged.moddev.legacyforge") version "2.0.141"
 }
 
 val mcVersion: String by extra
-val forgeVersion: String by extra
 val ccVersion: String by extra
+// Captured outside legacyForge to avoid shadowing by the DSL's own forgeVersion property
+val forgeVersionNumber = project.extra["forgeVersion"] as String
 
 repositories {
     maven("https://maven.squiddev.cc") {
@@ -13,25 +14,33 @@ repositories {
     }
 }
 
-minecraft {
-    mappings("official", mcVersion)
+legacyForge {
+    enable {
+        forgeVersion = "$mcVersion-$forgeVersionNumber"
+    }
+
+    val claudecc by mods.registering {
+        sourceSet(sourceSets["main"])
+    }
 
     runs {
+        configureEach {
+            loadedMods.add(claudecc)
+        }
         create("client") {
-            workingDirectory(project.file("run"))
-            mods { create("claudecc") { source(sourceSets["main"]) } }
+            client()
+            gameDirectory = project.file("run")
         }
         create("server") {
-            workingDirectory(project.file("run/server"))
-            mods { create("claudecc") { source(sourceSets["main"]) } }
+            server()
+            gameDirectory = project.file("run/server")
         }
     }
 }
 
 dependencies {
-    minecraft("net.minecraftforge:forge:$mcVersion-$forgeVersion")
-    // Only the API jar is needed at compile time; the full mod provides it at runtime.
-    compileOnly(fg.deobf("cc.tweaked:cc-tweaked-$mcVersion-common-api:$ccVersion"))
+    compileOnly("cc.tweaked:cc-tweaked-$mcVersion-common-api:$ccVersion")
+    modRuntimeOnly("cc.tweaked:cc-tweaked-$mcVersion-forge:$ccVersion")
 }
 
 tasks.jar {
