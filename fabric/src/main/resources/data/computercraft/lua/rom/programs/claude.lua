@@ -632,10 +632,64 @@ local function agentChat(userInput)
     end
 end
 
+-- ─── Concurrent input capture (runs alongside agentChat via parallel) ────────
+-- ta = {buf="", pos=1, entered=false}
+local function captureTyping(ta)
+    term.setCursorPos(1, INPUT_ROW)
+    term.clearLine()
+    col(C.yellow); term.write("> "); col(C.white)
+    term.setCursorBlink(true)
+
+    local scroll = 0
+    local function clamp()
+        local vw = w - 2
+        if ta.pos <= scroll then scroll = ta.pos - 1
+        elseif ta.pos > scroll + vw then scroll = ta.pos - vw end
+    end
+    local function redraw()
+        term.setCursorPos(3, INPUT_ROW)
+        col(C.white)
+        local vis = ta.buf .. " "
+        term.write(vis:sub(scroll+1, scroll+(w-2)))
+        term.setCursorPos(2 + (ta.pos - scroll), INPUT_ROW)
+    end
+
+    while true do
+        local ev, p1, p2, p3 = os.pullEvent()
+        if ev == "char" then
+            ta.buf = ta.buf:sub(1, ta.pos-1) .. p1 .. ta.buf:sub(ta.pos)
+            ta.pos = ta.pos + 1; clamp(); redraw()
+        elseif ev == "key" then
+            if     p1 == keys.backspace and ta.pos > 1 then
+                ta.buf = ta.buf:sub(1, ta.pos-2) .. ta.buf:sub(ta.pos)
+                ta.pos = ta.pos - 1; clamp(); redraw()
+            elseif p1 == keys.delete and ta.pos <= #ta.buf then
+                ta.buf = ta.buf:sub(1, ta.pos-1) .. ta.buf:sub(ta.pos+1)
+                clamp(); redraw()
+            elseif p1 == keys.left  and ta.pos > 1        then ta.pos = ta.pos - 1; clamp(); redraw()
+            elseif p1 == keys.right and ta.pos <= #ta.buf  then ta.pos = ta.pos + 1; clamp(); redraw()
+            elseif p1 == keys.home  then ta.pos = 1;            clamp(); redraw()
+            elseif p1 == keys["end"] then ta.pos = #ta.buf + 1; clamp(); redraw()
+            elseif p1 == keys.enter and #ta.buf > 0 then
+                ta.entered = true
+                term.setCursorBlink(false)
+                term.setCursorPos(1, INPUT_ROW)
+                term.clearLine()
+                col(C.yellow); term.write("> "); col(C.white)
+                while true do os.pullEvent() end  -- wait to be killed by parallel
+            end
+        elseif ev == "mouse_scroll" then
+            scrollOff = math.max(0, math.min(scrollOff - p1, math.max(0, #lineBuf - CHAT_HEIGHT)))
+            renderChat()
+            term.setCursorPos(2 + (ta.pos - scroll), INPUT_ROW)
+        end
+    end
+end
+
 -- ─── Custom readline (supports scroll, mouse selection, copy/paste) ──────────
-local function readline()
-    local buf      = ""
-    local pos         = 1  -- 1-indexed insert position
+local function readline(initBuf, initPos)
+    local buf         = initBuf or ""
+    local pos         = initPos or (#buf + 1)
     local inputScroll = 0  -- chars scrolled off the left of the input view
     local ctrlHeld    = false
 
@@ -668,6 +722,7 @@ local function readline()
     term.setCursorPos(1, INPUT_ROW)
     term.clearLine()
     col(C.yellow); term.write("> "); col(C.white)
+    if #buf > 0 then clampInputScroll(); redrawInput() end
     term.setCursorBlink(true)
 
     while true do
@@ -830,15 +885,38 @@ pushBlank()
 newContent()
 
 local _ok, _err = xpcall(function()
+    local taheadBuf, taheadPos = "", 1  -- partial input saved from concurrent typing
+    local pendingMsg = nil              -- complete message queued while Claude was responding
+
     while true do
-        local input = readline()
+        local input
+        if pendingMsg then
+            input, pendingMsg = pendingMsg, nil
+        else
+            input = readline(taheadBuf ~= "" and taheadBuf or nil,
+                             taheadBuf ~= "" and taheadPos or nil)
+            taheadBuf, taheadPos = "", 1
+        end
+
         if input == nil then break end
         if input ~= "" then
             pushBlank()
             pushLine("> " .. input, C.yellow)
             pushLine("...", C.lightGrey)
             newContent()
-            agentChat(input)
+
+            local ta = {buf = "", pos = 1, entered = false}
+            parallel.waitForAny(
+                function() agentChat(input) end,
+                function() captureTyping(ta) end
+            )
+
+            if ta.entered and ta.buf ~= "" then
+                pendingMsg = ta.buf        -- queue for next loop iteration
+            elseif ta.buf ~= "" then
+                taheadBuf = ta.buf         -- pre-fill next readline
+                taheadPos = ta.pos
+            end
         end
     end
 end, function(e)
