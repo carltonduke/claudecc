@@ -2,8 +2,10 @@
 # claudecc
 
 ![image](./doc/videos/star_field_example_2_short.gif)
+<sup><sub>Claude-created script</sub></sup>
 
-**claudecc** is an addon for [CC:Tweaked](https://github.com/cc-tweaked/cc-tweaked) at adds an interactive multi-turn Claude AI chat interface program to any in-game computer or turtle via the `claude` CraftOS command.
+
+**claudecc** is an addon for [CC:Tweaked](https://github.com/cc-tweaked/cc-tweaked) that adds an interactive multi-turn Claude AI chat interface program to any in-game computer or turtle via the `claude` CraftOS command.
 
 - `/claudecc api <key>` operator command stores the Anthropic API key to
     <world>/computercraft/claude_api_key
