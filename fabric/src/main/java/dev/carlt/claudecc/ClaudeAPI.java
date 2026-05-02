@@ -128,6 +128,7 @@ public class ClaudeAPI implements ILuaAPI {
                         if ("tool_use".equals(block.get("type").getAsString())) {
                             toolId[0]   = block.get("id").getAsString();
                             toolName[0] = block.get("name").getAsString();
+                            toolInput.setLength(0);  // reset for each new tool block
                         }
                     }
                     case "content_block_delta" -> {

@@ -5,6 +5,16 @@ if not claudecc then
     error("The claudecc API is not available on this computer.", 0)
 end
 
+-- ─── Debug log (forge/run/saves/<world>/computercraft/computer/<id>/claude_debug.log) ─
+local _logFile = fs.open("claude_debug.log", "a")
+local function log(msg)
+    if _logFile then
+        _logFile.writeLine("[" .. os.clock() .. "] " .. tostring(msg))
+        _logFile.flush()
+    end
+end
+log("──── session start ────")
+
 -- ─── Layout ──────────────────────────────────────────────────────────────────
 local w, h = term.getSize()
 local HEADER_ROWS = 2   -- title + separator
@@ -333,13 +343,38 @@ local TOOLS_JSON = textutils.serialiseJSON({
             required   = {"api"},
         },
     },
+    {
+        name = "run_file",
+        description = "Run a Lua program file on this computer via the shell.",
+        input_schema = {
+            type = "object",
+            properties = { path = {type = "string", description = "Path to the Lua file to run"} },
+            required   = {"path"},
+        },
+    },
+    {
+        name = "list_peripherals",
+        description = "List all peripherals currently connected to this computer, with their type and available methods.",
+        input_schema = {type = "object", properties = {}},
+    },
+    {
+        name = "pastebin_put",
+        description = "Upload a file to pastebin.com and return the URL and the 'pastebin get' command.",
+        input_schema = {
+            type = "object",
+            properties = { path = {type = "string", description = "Path to the file to upload"} },
+            required   = {"path"},
+        },
+    },
 })
 
 -- ─── Tool executor ───────────────────────────────────────────────────────────
 local function execTool(name, input)
+    log("tool call: " .. tostring(name) .. " input=" .. textutils.serialiseJSON(input or {}))
     if name == "read_file" then
         local path = input.path
-        if not fs.exists(path)  then return "Error: not found: " .. path end
+        if not path            then return "Error: missing 'path' argument" end
+        if not fs.exists(path) then return "Error: not found: " .. path end
         if fs.isDir(path)       then return "Error: is a directory, use list_dir" end
         local ok, res = pcall(function()
             local f = fs.open(path, "r")
@@ -348,6 +383,8 @@ local function execTool(name, input)
         return ok and res or ("Error: " .. res)
 
     elseif name == "write_file" then
+        if not input.path    then return "Error: missing 'path' argument" end
+        if not input.content then return "Error: missing 'content' argument" end
         local ok, err = pcall(function()
             local f = fs.open(input.path, "w")
             f.write(input.content); f.close()
@@ -377,9 +414,10 @@ local function execTool(name, input)
         return textutils.serialiseJSON(apis)
 
     elseif name == "get_api_methods" then
-        local api = _G[input.api]
-        if not api then return "Error: API '" .. input.api .. "' not found." end
-        if type(api) ~= "table" then return "'" .. input.api .. "' is not a table." end
+        if not input.api then return "Error: missing 'api' argument" end
+        local api = _G[input.api] or peripheral.wrap(input.api)
+        if not api then return "Error: '" .. input.api .. "' is not a Lua API or connected peripheral." end
+        if type(api) ~= "table" then return "Error: '" .. input.api .. "' is not a table." end
         local methods = {}
         for k, v in pairs(api) do
             if type(v) == "function" then table.insert(methods, k) end
@@ -387,13 +425,112 @@ local function execTool(name, input)
         table.sort(methods)
         return textutils.serialiseJSON(methods)
 
+    elseif name == "list_peripherals" then
+        local result = {}
+        for _, pname in ipairs(peripheral.getNames()) do
+            result[pname] = {
+                type    = peripheral.getType(pname),
+                methods = peripheral.getMethods(pname),
+            }
+        end
+        if next(result) == nil then return "No peripherals connected." end
+        return textutils.serialiseJSON(result)
+
+    elseif name == "run_file" then
+        local path = input.path
+        if not path            then return "Error: missing 'path' argument" end
+        if not fs.exists(path) then return "Error: not found: " .. path end
+        local ok = shell.run(path)
+        return ok and "Program ran successfully." or "Program exited with an error (check terminal output)."
+
+    elseif name == "pastebin_put" then
+        local path = input.path
+        if not path            then return "Error: missing 'path' argument" end
+        if not fs.exists(path) then return "Error: not found: " .. path end
+        local f = fs.open(path, "r")
+        if not f then return "Error: could not open file" end
+        local content = f.readAll(); f.close()
+        local ok, response = pcall(function()
+            return http.post(
+                "https://pastebin.com/api/api_post.php",
+                "api_option=paste" ..
+                "&api_dev_key=0ec2eb25b6166c0c27a394ae118ad829" ..
+                "&api_paste_code=" .. textutils.urlEncode(content) ..
+                "&api_paste_format=lua" ..
+                "&api_paste_expire_date=N"
+            )
+        end)
+        if not ok or not response then
+            return "Error: HTTP request failed: " .. tostring(response)
+        end
+        local url = response.readAll(); response.close()
+        if url:find("^Bad API request") then return "Error: " .. url end
+        local code = url:match("/([^/]+)$") or url
+        return "Uploaded!\nURL: " .. url .. "\nTo download on any CC computer: pastebin get " .. code
+
     else
         return "Error: unknown tool '" .. name .. "'"
     end
 end
 
 -- ─── Agentic loop ────────────────────────────────────────────────────────────
-local history = {}
+local function buildSystemContext()
+    local lines = {}
+    lines[#lines+1] = "You are running inside a CC:Tweaked computer in Minecraft."
+    lines[#lines+1] = "Computer ID: " .. os.computerID() ..
+        (os.computerLabel() and (", label: " .. os.computerLabel()) or "")
+    lines[#lines+1] = "Is turtle: " .. tostring(turtle ~= nil)
+
+    -- Peripherals
+    local names = peripheral.getNames()
+    if #names == 0 then
+        lines[#lines+1] = "Connected peripherals: none"
+    else
+        lines[#lines+1] = "Connected peripherals:"
+        for _, pname in ipairs(names) do
+            local ptype    = peripheral.getType(pname)
+            local methods  = peripheral.getMethods(pname)
+            table.sort(methods)
+            lines[#lines+1] = "  " .. pname .. " (" .. ptype .. "): " .. table.concat(methods, ", ")
+        end
+    end
+
+    lines[#lines+1] = "ROM APIs are at /rom/apis/ (fs, http, rednet, peripheral, term, textutils, etc.)."
+    lines[#lines+1] = "ROM programs are at /rom/programs/. Use read_file to inspect any of them."
+    return table.concat(lines, "\n")
+end
+
+local HISTORY_FILE = "claude_history.json"
+local MAX_HISTORY  = 60  -- max saved messages (not counting system context pair)
+
+local history = {
+    {role = "user",      content = buildSystemContext()},
+    {role = "assistant", content = "Understood. I know my environment and am ready to help."},
+}
+
+-- Save everything after the system context pair.
+local function saveHistory()
+    local toSave = {}
+    for i = 3, #history do toSave[#toSave+1] = history[i] end
+    local f = fs.open(HISTORY_FILE, "w")
+    if f then f.write(textutils.serialiseJSON(toSave)); f.close() end
+end
+
+-- Load saved history into history table; returns number of messages loaded.
+local function loadHistory()
+    if not fs.exists(HISTORY_FILE) then return 0 end
+    local ok, data = pcall(function()
+        local f = fs.open(HISTORY_FILE, "r")
+        local s = f.readAll(); f.close()
+        return textutils.unserialiseJSON(s)
+    end)
+    if not ok or type(data) ~= "table" or #data == 0 then return 0 end
+    local start = math.max(1, #data - MAX_HISTORY + 1)
+    for i = start, #data do history[#history+1] = data[i] end
+    return #data - start + 1
+end
+
+local pastCount = loadHistory()
 
 -- Push plain (non-markdown) text into lineBuf, respecting newlines and word-wrap.
 local function pushPlainText(text)
@@ -411,8 +548,10 @@ local function pushPlainText(text)
 end
 
 local function agentChat(userInput)
+    log("user: " .. tostring(userInput))
     table.insert(history, {role = "user", content = userInput})
     claudecc.ask(textutils.serialiseJSON(history), TOOLS_JSON)
+    log("ask() sent")
 
     local streamStart = nil  -- lineBuf index where the streaming response begins
     local streamBuf   = ""   -- accumulated text received via claude_chunk
@@ -437,11 +576,13 @@ local function agentChat(userInput)
 
         elseif ev == "claude_response" then
             -- a = full response text (sent after all chunks)
+            log("claude_response: " .. tostring(a and #a or 0) .. " chars")
             finishStream()
             if a and a ~= "" then
                 pushMarkdown(a)
                 table.insert(history, {role = "assistant", content = a})
             end
+            saveHistory()
             newContent()
             return true
 
@@ -449,6 +590,7 @@ local function agentChat(userInput)
             -- a=textBefore, b=toolId, c=toolName, d=inputJson
             finishStream()
             local textBefore, toolId, toolName, inputJson = a, b, c, d
+            log("claude_tool_use: name=" .. tostring(toolName) .. " inputJson=" .. tostring(inputJson))
             local input = textutils.unserialiseJSON(inputJson) or {}
 
             if textBefore and textBefore ~= "" then
@@ -458,6 +600,7 @@ local function agentChat(userInput)
             newContent()
 
             local result = execTool(toolName, input)
+            log("tool result: " .. tostring(result and result:sub(1, 200) or "nil"))
 
             -- Build assistant content array (text + tool_use)
             local assistantContent = {}
@@ -480,6 +623,7 @@ local function agentChat(userInput)
             streamStart, streamBuf = nil, ""
 
         elseif ev == "claude_error" then
+            log("claude_error: " .. tostring(a))
             finishStream()
             pushLine("Error: " .. tostring(a), C.red)
             newContent()
@@ -552,10 +696,17 @@ local function readline()
 
             elseif p1 == keys.enter then
                 term.setCursorBlink(false)
+                term.setCursorPos(1, INPUT_ROW)
+                term.clearLine()
+                col(C.yellow); term.write("> "); col(C.white)
                 return buf
 
-            elseif ctrlHeld and p1 == keys.c and selA then
-                claudecc.copyToClipboard(getSelectedText())
+            elseif ctrlHeld and p1 == keys.c then
+                if selA then
+                    claudecc.copyToClipboard(getSelectedText())
+                elseif #buf > 0 then
+                    claudecc.copyToClipboard(buf)
+                end
 
             elseif p1 == keys.backspace and pos > 1 then
                 buf = buf:sub(1, pos - 2) .. buf:sub(pos)
@@ -671,30 +822,39 @@ renderChat()
 col(C.lightGrey)
 pushBlank()
 pushLine("Hello! I have access to your filesystem and Lua APIs.", C.lightGrey)
+if pastCount > 0 then
+    pushLine("Resuming — " .. pastCount .. " messages from last session loaded.", C.grey)
+end
 pushLine("Ask me anything, or say 'read /startup.lua' to get started.", C.lightGrey)
 pushBlank()
 newContent()
 
-while true do
-    local input = readline()
-    if input == nil then break end
-    if input ~= "" then
-        -- Show the user's message in the chat area
-        pushBlank()
-        pushLine("> " .. input, C.yellow)
-        pushLine("...", C.lightGrey)
-        newContent()
-
-        -- Clear the "thinking" indicator after response
-        agentChat(input)
-        -- Remove the "..." line (last pushed before agentChat added content)
-        -- Actually just leave it; the response follows naturally
+local _ok, _err = xpcall(function()
+    while true do
+        local input = readline()
+        if input == nil then break end
+        if input ~= "" then
+            pushBlank()
+            pushLine("> " .. input, C.yellow)
+            pushLine("...", C.lightGrey)
+            newContent()
+            agentChat(input)
+        end
     end
-end
+end, function(e)
+    log("CRASH: " .. tostring(e))
+    return e
+end)
 
 -- Cleanup
+if _logFile then _logFile.close() end
 term.setCursorPos(1, h)
 term.clearLine()
+if not _ok then
+    col(C.red)
+    print("Crashed! Error saved to claude_debug.log")
+    print(tostring(_err))
+end
 col(C.lightGrey)
 print("Goodbye!")
 col(C.white)
