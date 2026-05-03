@@ -441,7 +441,8 @@ local function execTool(name, input)
         if not path            then return "Error: missing 'path' argument" end
         if not fs.exists(path) then return "Error: not found: " .. path end
         local ok = shell.run(path)
-        return ok and "Program ran successfully." or "Program exited with an error (check terminal output)."
+        return ok and "Program ran successfully." or
+            "Program stopped. If the user pressed Ctrl+T to terminate it intentionally, do not treat this as an error — ask whether they want to continue or make changes."
 
     elseif name == "pastebin_put" then
         local path = input.path
@@ -564,9 +565,15 @@ local function agentChat(userInput)
     end
 
     while true do
-        local ev, a, b, c, d = os.pullEvent()
+        local ev, a, b, c, d = os.pullEventRaw()
 
-        if ev == "claude_chunk" then
+        if ev == "terminate" then
+            finishStream()
+            pushLine("(interrupted)", C.grey)
+            newContent()
+            return false
+
+        elseif ev == "claude_chunk" then
             -- a = incremental text delta from the streaming API
             if not streamStart then streamStart = #lineBuf + 1 end
             streamBuf = streamBuf .. a
@@ -655,7 +662,8 @@ local function captureTyping(ta)
     end
 
     while true do
-        local ev, p1, p2, p3 = os.pullEvent()
+        local ev, p1, p2, p3 = os.pullEventRaw()
+        if ev == "terminate" then return end
         if ev == "char" then
             ta.buf = ta.buf:sub(1, ta.pos-1) .. p1 .. ta.buf:sub(ta.pos)
             ta.pos = ta.pos + 1; clamp(); redraw()
@@ -676,7 +684,9 @@ local function captureTyping(ta)
                 term.setCursorPos(1, INPUT_ROW)
                 term.clearLine()
                 col(C.yellow); term.write("> "); col(C.white)
-                while true do os.pullEvent() end  -- wait to be killed by parallel
+                while true do                         -- wait to be killed by parallel
+                    if os.pullEventRaw() == "terminate" then return end
+                end
             end
         elseif ev == "mouse_scroll" then
             scrollOff = math.max(0, math.min(scrollOff - p1, math.max(0, #lineBuf - CHAT_HEIGHT)))
@@ -869,6 +879,86 @@ local function renderHeader()
     col(C.white)
 end
 
+-- ─── Slash commands ──────────────────────────────────────────────────────────
+local function handleClear()
+    history = {
+        {role = "user",      content = buildSystemContext()},
+        {role = "assistant", content = "Understood. I know my environment and am ready to help."},
+    }
+    saveHistory()
+    lineBuf = {}
+    scrollOff = 0
+    renderHeader()
+    renderChat()
+    pushBlank()
+    pushLine("History cleared.", C.grey)
+    pushBlank()
+    newContent()
+end
+
+local function handleCompact()
+    if #history <= 2 then
+        pushLine("Nothing to compact yet.", C.grey)
+        newContent()
+        return
+    end
+
+    pushLine("Compacting...", C.grey)
+    newContent()
+
+    -- Build a one-shot request: existing history + summary prompt, no tools
+    local req = {}
+    for _, m in ipairs(history) do req[#req+1] = m end
+    req[#req+1] = {
+        role    = "user",
+        content = "Summarise our conversation so far in 3-5 sentences. " ..
+                  "Capture key facts about this computer, tasks completed, outcomes, " ..
+                  "and anything needed to continue naturally. Be concise.",
+    }
+    claudecc.ask(textutils.serialiseJSON(req))  -- no tools arg
+
+    local summary, summaryBuf = nil, ""
+    while true do
+        local ev, a = os.pullEventRaw()
+        if ev == "terminate" then return end
+        if ev == "claude_chunk" then
+            summaryBuf = summaryBuf .. (a or "")
+        elseif ev == "claude_response" then
+            summary = a ~= "" and a or summaryBuf
+            break
+        elseif ev == "claude_error" then
+            pushLine("Compact failed: " .. tostring(a), C.red)
+            newContent()
+            return
+        end
+    end
+
+    if not summary or summary == "" then return end
+
+    local before = #history
+    history = {
+        {role = "user",      content = buildSystemContext()},
+        {role = "assistant", content = "Understood. I know my environment and am ready to help."},
+        {role = "user",      content = "[Conversation summary]: " .. summary},
+        {role = "assistant", content = "Got it, I have the context from our previous conversation."},
+    }
+    saveHistory()
+
+    -- Replace the "Compacting..." line with the result
+    if lineBuf[#lineBuf] then table.remove(lineBuf) end
+    pushLine("✓ Compacted " .. (before - 2) .. " messages into summary.", C.grey)
+    newContent()
+end
+
+local COMMANDS = {
+    compact = handleCompact,
+    clear   = handleClear,
+    help    = function()
+        pushLine("Commands: /compact  /clear  /help", C.grey)
+        newContent()
+    end,
+}
+
 -- ─── Main ─────────────────────────────────────────────────────────────────────
 term.clear()
 renderHeader()
@@ -900,22 +990,33 @@ local _ok, _err = xpcall(function()
 
         if input == nil then break end
         if input ~= "" then
-            pushBlank()
-            pushLine("> " .. input, C.yellow)
-            pushLine("...", C.lightGrey)
-            newContent()
+            local cmd = input:match("^/(%S*)$")
+            if cmd ~= nil then
+                local fn = COMMANDS[cmd:lower()]
+                if fn then
+                    fn()
+                else
+                    pushLine("Unknown command: /" .. cmd .. "  (try /help)", C.red)
+                    newContent()
+                end
+            else
+                pushBlank()
+                pushLine("> " .. input, C.yellow)
+                pushLine("...", C.lightGrey)
+                newContent()
 
-            local ta = {buf = "", pos = 1, entered = false}
-            parallel.waitForAny(
-                function() agentChat(input) end,
-                function() captureTyping(ta) end
-            )
+                local ta = {buf = "", pos = 1, entered = false}
+                parallel.waitForAny(
+                    function() agentChat(input) end,
+                    function() captureTyping(ta) end
+                )
 
-            if ta.entered and ta.buf ~= "" then
-                pendingMsg = ta.buf        -- queue for next loop iteration
-            elseif ta.buf ~= "" then
-                taheadBuf = ta.buf         -- pre-fill next readline
-                taheadPos = ta.pos
+                if ta.entered and ta.buf ~= "" then
+                    pendingMsg = ta.buf        -- queue for next loop iteration
+                elseif ta.buf ~= "" then
+                    taheadBuf = ta.buf         -- pre-fill next readline
+                    taheadPos = ta.pos
+                end
             end
         end
     end
