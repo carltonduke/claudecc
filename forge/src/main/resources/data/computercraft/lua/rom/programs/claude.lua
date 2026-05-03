@@ -41,6 +41,12 @@ local C = {
     red       = colours.red,
 }
 
+-- ─── Token usage tracking ────────────────────────────────────────────────────
+local lastInputTokens    = 0
+local lastOutputTokens   = 0
+local lastRatelimitLeft  = -1   -- -1 = unknown
+local AUTO_COMPACT_THRESHOLD = 18000  -- auto-compact when input tokens exceed this
+
 -- ─── Scroll buffer ────────────────────────────────────────────────────────────
 -- Each entry is a list of {text, colour} segments forming one screen line.
 local lineBuf   = {}
@@ -573,6 +579,14 @@ local function agentChat(userInput)
             newContent()
             return false
 
+        elseif ev == "claude_usage" then
+            -- a=inputTokens, b=outputTokens, c=ratelimitRemaining
+            lastInputTokens  = a or 0
+            lastOutputTokens = b or 0
+            lastRatelimitLeft = c or -1
+            log("usage: in=" .. tostring(a) .. " out=" .. tostring(b) .. " remaining=" .. tostring(c))
+            renderHeader()
+
         elseif ev == "claude_chunk" then
             -- a = incremental text delta from the streaming API
             if not streamStart then streamStart = #lineBuf + 1 end
@@ -880,6 +894,20 @@ local function renderHeader()
     col(C.cyan)
     term.clearLine()
     term.write("Claude Shell")
+    -- Token usage indicator (right-aligned)
+    if lastInputTokens > 0 then
+        local warn = lastInputTokens >= AUTO_COMPACT_THRESHOLD
+        local label
+        if lastRatelimitLeft >= 0 then
+            label = string.format("[%dk/%dk left]",
+                math.floor(lastInputTokens/1000), math.floor(lastRatelimitLeft/1000))
+        else
+            label = string.format("[%dk tokens]", math.floor(lastInputTokens/1000))
+        end
+        col(warn and C.red or C.grey)
+        term.setCursorPos(w - #label + 1, 1)
+        term.write(label)
+    end
     col(C.grey)
     term.setCursorPos(#"Claude Shell" + 2, 1)
     term.write("(PgUp/PgDn or scroll to navigate, Ctrl+T quits)")
@@ -1025,6 +1053,14 @@ local _ok, _err = xpcall(function()
                     function() agentChat(input) end,
                     function() captureTyping(ta) end
                 )
+
+                -- Auto-compact if context is getting large
+                if lastInputTokens >= AUTO_COMPACT_THRESHOLD then
+                    pushBlank()
+                    pushLine("↻ Auto-compacting (" .. lastInputTokens .. " input tokens)…", C.grey)
+                    newContent()
+                    handleCompact()
+                end
 
                 if ta.entered and ta.buf ~= "" then
                     pendingMsg = ta.buf        -- queue for next loop iteration

@@ -101,7 +101,10 @@ public class ClaudeAPI implements ILuaAPI {
                         "API returned status " + response.statusCode() + ": " + extractError(body));
                     return;
                 }
-                processStream(response.body());
+                var remaining = response.headers()
+                    .firstValue("anthropic-ratelimit-input-tokens-remaining")
+                    .map(Integer::parseInt).orElse(-1);
+                processStream(response.body(), remaining);
             })
             .exceptionally(err -> {
                 computer.queueEvent("claude_error", err.getMessage());
@@ -109,12 +112,14 @@ public class ClaudeAPI implements ILuaAPI {
             });
     }
 
-    private void processStream(java.util.stream.Stream<String> lines) {
-        var fullText   = new StringBuilder();
-        var toolId     = new String[]{null};
-        var toolName   = new String[]{null};
-        var toolInput  = new StringBuilder();
-        var stopReason = new String[]{"end_turn"};
+    private void processStream(java.util.stream.Stream<String> lines, int ratelimitRemaining) {
+        var fullText     = new StringBuilder();
+        var toolId       = new String[]{null};
+        var toolName     = new String[]{null};
+        var toolInput    = new StringBuilder();
+        var stopReason   = new String[]{"end_turn"};
+        var inputTokens  = new int[]{0};
+        var outputTokens = new int[]{0};
 
         lines.forEach(line -> {
             if (!line.startsWith("data: ")) return;
@@ -123,6 +128,13 @@ public class ClaudeAPI implements ILuaAPI {
             try {
                 var json = JsonParser.parseString(data).getAsJsonObject();
                 switch (json.get("type").getAsString()) {
+                    case "message_start" -> {
+                        var msg = json.getAsJsonObject("message");
+                        if (msg.has("usage")) {
+                            var u = msg.getAsJsonObject("usage");
+                            if (u.has("input_tokens")) inputTokens[0] = u.get("input_tokens").getAsInt();
+                        }
+                    }
                     case "content_block_start" -> {
                         var block = json.getAsJsonObject("content_block");
                         if ("tool_use".equals(block.get("type").getAsString())) {
@@ -146,10 +158,16 @@ public class ClaudeAPI implements ILuaAPI {
                         var d = json.getAsJsonObject("delta");
                         if (d.has("stop_reason") && !d.get("stop_reason").isJsonNull())
                             stopReason[0] = d.get("stop_reason").getAsString();
+                        if (json.has("usage")) {
+                            var u = json.getAsJsonObject("usage");
+                            if (u.has("output_tokens")) outputTokens[0] = u.get("output_tokens").getAsInt();
+                        }
                     }
                 }
             } catch (Exception ignored) {}
         });
+
+        computer.queueEvent("claude_usage", inputTokens[0], outputTokens[0], ratelimitRemaining);
 
         if ("tool_use".equals(stopReason[0]) && toolId[0] != null) {
             computer.queueEvent("claude_tool_use",
