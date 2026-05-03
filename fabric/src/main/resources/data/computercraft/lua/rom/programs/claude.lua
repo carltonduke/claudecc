@@ -609,18 +609,33 @@ local function agentChat(userInput)
             local result = execTool(toolName, input)
             log("tool result: " .. tostring(result and result:sub(1, 200) or "nil"))
 
-            -- Build assistant content array (text + tool_use)
+            -- Build assistant content array (text + tool_use).
+            -- Large string fields (e.g. write_file content) are replaced with a
+            -- path reference — the file is on disk so Claude can read_file it again.
+            local histInput = {}
+            for k, v in pairs(input) do
+                if type(v) == "string" and #v > 300 and k ~= "path" then
+                    histInput[k] = "(omitted — see " .. tostring(input.path or "file") .. ")"
+                else
+                    histInput[k] = v
+                end
+            end
+
             local assistantContent = {}
             if textBefore and textBefore ~= "" then
                 table.insert(assistantContent, {type = "text", text = textBefore})
             end
-            table.insert(assistantContent, {type = "tool_use", id = toolId, name = toolName, input = input})
+            table.insert(assistantContent, {type = "tool_use", id = toolId, name = toolName, input = histInput})
             table.insert(history, {role = "assistant", content = assistantContent})
 
-            -- Tool result
+            -- Tool result — truncate large results (e.g. read_file on a big file).
+            local histResult = result
+            if type(result) == "string" and #result > 800 then
+                histResult = result:sub(1, 800) .. "\n...(truncated — use read_file for full content)"
+            end
             table.insert(history, {
                 role = "user",
-                content = {{type = "tool_result", tool_use_id = toolId, content = result}},
+                content = {{type = "tool_result", tool_use_id = toolId, content = histResult}},
             })
 
             pushLine("  ✓ done", C.grey)
