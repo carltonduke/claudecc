@@ -1,11 +1,14 @@
 plugins {
-    id("net.neoforged.moddev.legacyforge") version "2.0.141"
+    id("net.neoforged.moddev") version "2.0.141"
 }
 
 val mcVersion: String by extra
 val ccVersion: String by extra
-// Captured outside legacyForge to avoid shadowing by the DSL's own forgeVersion property
-val forgeVersionNumber = project.extra["forgeVersion"] as String
+val neoforgeVersion: String by extra
+
+base {
+    archivesName = "claudecc-forge"
+}
 
 repositories {
     maven("https://maven.squiddev.cc") {
@@ -14,10 +17,8 @@ repositories {
     }
 }
 
-legacyForge {
-    enable {
-        forgeVersion = "$mcVersion-$forgeVersionNumber"
-    }
+neoForge {
+    version = neoforgeVersion
 
     val claudecc by mods.registering {
         sourceSet(sourceSets["main"])
@@ -40,7 +41,7 @@ legacyForge {
 
 dependencies {
     compileOnly("cc.tweaked:cc-tweaked-$mcVersion-common-api:$ccVersion")
-    modRuntimeOnly("cc.tweaked:cc-tweaked-$mcVersion-forge:$ccVersion")
+
 }
 
 tasks.jar {
