@@ -1,5 +1,5 @@
 modLoader="javafml"
-loaderVersion="[47,48)"
+loaderVersion="[4,)"
 license="MIT"
 
 [[mods]]
@@ -19,15 +19,15 @@ Run /claudecc api <key> as an operator, then run the 'claude' program on any com
     side="BOTH"
 
 [[dependencies.claudecc]]
-    modId="forge"
+    modId="neoforge"
     mandatory=true
-    versionRange="[47,48)"
+    versionRange="[21.1,22)"
     ordering="NONE"
     side="BOTH"
 
 [[dependencies.claudecc]]
     modId="minecraft"
     mandatory=true
-    versionRange="[1.20.1,1.21)"
+    versionRange="[1.21.1,1.22)"
     ordering="NONE"
     side="BOTH"
