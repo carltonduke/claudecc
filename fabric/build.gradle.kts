@@ -13,6 +13,7 @@ repositories {
         content { includeGroup("cc.tweaked") }
     }
     maven("https://maven.fabricmc.net")
+    mavenCentral()
 }
 
 dependencies {
@@ -22,4 +23,5 @@ dependencies {
     modImplementation("net.fabricmc.fabric-api:fabric-api:$fabricApiVersion")
     // Only the API jar is needed at compile time; the full mod provides it at runtime.
     modCompileOnly("cc.tweaked:cc-tweaked-$mcVersion-fabric-api:$ccVersion")
+    modImplementation("me.lucko:fabric-permissions-api:0.3.3")
 }

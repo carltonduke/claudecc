@@ -554,10 +554,37 @@ local function pushPlainText(text)
     if first then bufLine({}) end
 end
 
+local renderHeader   -- forward decl; defined below, called from agentChat
+local handleCompact  -- forward decl; defined below, called from sendWithPreflight
+
+-- Rough input-token estimate from serialised history (~4 chars/token avg).
+local function estimateInputTokens(hist)
+    return math.floor(#textutils.serialiseJSON(hist) / 4)
+end
+
+-- Wrapper around claudecc.ask that:
+--   1. Pre-flight estimates input tokens and compacts proactively if over the threshold,
+--      so a single oversized request can't blow past the per-minute rate limit.
+--   2. Refreshes the header indicator with the estimate immediately (the real value
+--      arrives later via claude_usage).
+local function sendWithPreflight()
+    local est = estimateInputTokens(history)
+    if est >= AUTO_COMPACT_THRESHOLD and #history > 4 then
+        pushBlank()
+        pushLine("↻ Pre-emptive compact (" .. est .. " est. input tokens)…", C.grey)
+        newContent()
+        handleCompact()
+        est = estimateInputTokens(history)  -- handleCompact rebuilt history
+    end
+    lastInputTokens = est
+    renderHeader()
+    claudecc.ask(textutils.serialiseJSON(history), TOOLS_JSON)
+end
+
 local function agentChat(userInput)
     log("user: " .. tostring(userInput))
     table.insert(history, {role = "user", content = userInput})
-    claudecc.ask(textutils.serialiseJSON(history), TOOLS_JSON)
+    sendWithPreflight()
     log("ask() sent")
 
     local streamStart = nil  -- lineBuf index where the streaming response begins
@@ -585,6 +612,14 @@ local function agentChat(userInput)
             lastOutputTokens = b or 0
             lastRatelimitLeft = c or -1
             log("usage: in=" .. tostring(a) .. " out=" .. tostring(b) .. " remaining=" .. tostring(c))
+            renderHeader()
+
+        elseif ev == "claude_ratelimit" then
+            -- Sent by ClaudeAPI on non-200 responses so the rate-limit half of the
+            -- indicator stays current even after a failed request. lastInputTokens
+            -- is intentionally not touched here.
+            lastRatelimitLeft = a or -1
+            log("ratelimit (no usage): remaining=" .. tostring(a))
             renderHeader()
 
         elseif ev == "claude_chunk" then
@@ -655,7 +690,7 @@ local function agentChat(userInput)
             pushLine("  ✓ done", C.grey)
             newContent()
 
-            claudecc.ask(textutils.serialiseJSON(history), TOOLS_JSON)
+            sendWithPreflight()
             streamStart, streamBuf = nil, ""
 
         elseif ev == "claude_error" then
@@ -888,7 +923,7 @@ local function readline(initBuf, initPos)
 end
 
 -- ─── Header ───────────────────────────────────────────────────────────────────
-local function renderHeader()
+function renderHeader()
     term.setCursorPos(1, 1)
     bg(colours.black)
     col(C.cyan)
@@ -939,7 +974,7 @@ local function handleClear()
     newContent()
 end
 
-local function handleCompact()
+function handleCompact()
     if #history <= 2 then
         pushLine("Nothing to compact yet.", C.grey)
         newContent()

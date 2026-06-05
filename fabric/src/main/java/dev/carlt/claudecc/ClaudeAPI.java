@@ -56,17 +56,23 @@ public class ClaudeAPI implements ILuaAPI {
         var toolsJson = args.count() > 1 ? args.getString(1) : null;
 
         var server = computer.getLevel().getServer();
-        var keyPath = ClaudeCommand.keyPath(server);
+        var activeUuid = ActiveUserTracker.getActive(computer.getID()).orElse(null);
+        if (activeUuid == null) {
+            computer.queueEvent("claude_error",
+                "No active player on this computer. Right-click it to claim it before running Claude.");
+            return;
+        }
+        var keyPath = ClaudeCommand.keyPath(server, activeUuid);
 
         String apiKey;
         try {
             if (!Files.exists(keyPath)) {
-                computer.queueEvent("claude_error", "No API key configured. An operator must run /claudecc api <key>.");
+                computer.queueEvent("claude_error", "Your API key isn't set. Run /claudecc api <key> to set it.");
                 return;
             }
             apiKey = Files.readString(keyPath).strip();
             if (apiKey.isEmpty()) {
-                computer.queueEvent("claude_error", "API key is empty. An operator must run /claudecc api <key>.");
+                computer.queueEvent("claude_error", "Your API key is empty. Run /claudecc api <key> to set it.");
                 return;
             }
         } catch (IOException e) {
@@ -94,16 +100,26 @@ public class ClaudeAPI implements ILuaAPI {
 
         HTTP_CLIENT.sendAsync(request, HttpResponse.BodyHandlers.ofLines())
             .thenAccept(response -> {
-                if (response.statusCode() != 200) {
-                    var body = response.body()
-                        .collect(java.util.stream.Collectors.joining());
-                    computer.queueEvent("claude_error",
-                        "API returned status " + response.statusCode() + ": " + extractError(body));
-                    return;
-                }
                 var remaining = response.headers()
                     .firstValue("anthropic-ratelimit-input-tokens-remaining")
                     .map(Integer::parseInt).orElse(-1);
+
+                if (response.statusCode() != 200) {
+                    var body = response.body()
+                        .collect(java.util.stream.Collectors.joining());
+                    if (remaining >= 0) {
+                        computer.queueEvent("claude_ratelimit", remaining);
+                    }
+                    var msg = "API returned status " + response.statusCode() + ": " + extractError(body);
+                    if (response.statusCode() == 429) {
+                        var retryAfter = response.headers().firstValue("retry-after").orElse(null);
+                        if (retryAfter != null) {
+                            msg += "  (retry-after " + retryAfter + "s, " + remaining + " input tokens left)";
+                        }
+                    }
+                    computer.queueEvent("claude_error", msg);
+                    return;
+                }
                 processStream(response.body(), remaining);
             })
             .exceptionally(err -> {
