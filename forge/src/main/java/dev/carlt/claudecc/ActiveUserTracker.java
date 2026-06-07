@@ -30,14 +30,13 @@ public final class ActiveUserTracker {
 
     /**
      * Returns the CC computer ID for the given block entity, or -1 if the block entity is not a
-     * CC: Tweaked computer (or if reflection fails). CC's public API does not expose the computer
-     * ID from a BlockEntity, so we resolve {@code getComputerID()} reflectively the first time we
-     * see a computer block entity and cache the {@link Method}.
+     * CC: Tweaked computer or turtle (or if reflection fails). CC's public API does not expose the
+     * computer ID from a BlockEntity, so we resolve {@code getComputerID()} reflectively the first
+     * time we see a computer-family block entity and cache the {@link Method}.
      */
     public static int extractComputerId(BlockEntity be) {
         if (be == null || reflectionFailed) return -1;
-        var className = be.getClass().getName();
-        if (!className.startsWith("dan200.computercraft.shared.computer.blocks.ComputerBlockEntity")) {
+        if (!isComputerFamily(be.getClass())) {
             return -1;
         }
         try {
@@ -54,5 +53,20 @@ public final class ActiveUserTracker {
             reflectionFailed = true;
             return -1;
         }
+    }
+
+    /**
+     * Both CC computers and turtles extend {@code AbstractComputerBlockEntity}, which declares
+     * {@code getComputerID()}. Walk the superclass chain to detect either, so that turtles (in the
+     * {@code ...shared.turtle.blocks} package) are recognised as well as plain computers.
+     */
+    private static boolean isComputerFamily(Class<?> cls) {
+        for (Class<?> c = cls; c != null; c = c.getSuperclass()) {
+            if (c.getName().equals(
+                    "dan200.computercraft.shared.computer.blocks.AbstractComputerBlockEntity")) {
+                return true;
+            }
+        }
+        return false;
     }
 }
