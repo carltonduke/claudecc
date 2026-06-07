@@ -46,6 +46,7 @@ local lastInputTokens    = 0
 local lastOutputTokens   = 0
 local lastRatelimitLeft  = -1   -- -1 = unknown
 local AUTO_COMPACT_THRESHOLD = 18000  -- auto-compact when input tokens exceed this
+local MAX_TOOL_ITERS = 25  -- cap consecutive tool calls in one turn (runaway-loop guard)
 
 -- ─── Scroll buffer ────────────────────────────────────────────────────────────
 -- Each entry is a list of {text, colour} segments forming one screen line.
@@ -70,6 +71,14 @@ local function screenRowToBufLine(screenRow)
     return (li >= 1 and li <= total) and li or nil
 end
 
+-- Return the plain text of lineBuf[i] (all segment texts concatenated).
+local function lineText(i)
+    if not lineBuf[i] then return "" end
+    local t = {}
+    for _, seg in ipairs(lineBuf[i]) do t[#t+1] = seg[1] end
+    return table.concat(t)
+end
+
 -- Return the text of the current selection as a newline-joined string.
 local function getSelectedText()
     if not selA or not selB then return "" end
@@ -88,14 +97,6 @@ end
 -- Add one screen-width line (already wrapped) to the buffer.
 local function bufLine(segments)
     table.insert(lineBuf, segments)
-end
-
--- Return the plain text of lineBuf[i] (all segment texts concatenated).
-local function lineText(i)
-    if not lineBuf[i] then return "" end
-    local t = {}
-    for _, seg in ipairs(lineBuf[i]) do t[#t+1] = seg[1] end
-    return table.concat(t)
 end
 
 -- Render the chat viewport.
@@ -589,6 +590,7 @@ local function agentChat(userInput)
 
     local streamStart = nil  -- lineBuf index where the streaming response begins
     local streamBuf   = ""   -- accumulated text received via claude_chunk
+    local toolIters   = 0    -- consecutive tool calls this turn (runaway-loop guard)
 
     local function finishStream()
         if streamStart then
@@ -658,23 +660,15 @@ local function agentChat(userInput)
             local result = execTool(toolName, input)
             log("tool result: " .. tostring(result and result:sub(1, 200) or "nil"))
 
-            -- Build assistant content array (text + tool_use).
-            -- Large string fields (e.g. write_file content) are replaced with a
-            -- path reference — the file is on disk so Claude can read_file it again.
-            local histInput = {}
-            for k, v in pairs(input) do
-                if type(v) == "string" and #v > 300 and k ~= "path" then
-                    histInput[k] = "(omitted — see " .. tostring(input.path or "file") .. ")"
-                else
-                    histInput[k] = v
-                end
-            end
-
+            -- Build assistant content array (text + tool_use). The tool_use input
+            -- must faithfully record what Claude actually sent — mutating it (e.g.
+            -- omitting a large write_file content) corrupts the transcript and makes
+            -- Claude distrust its own write and re-issue it endlessly.
             local assistantContent = {}
             if textBefore and textBefore ~= "" then
                 table.insert(assistantContent, {type = "text", text = textBefore})
             end
-            table.insert(assistantContent, {type = "tool_use", id = toolId, name = toolName, input = histInput})
+            table.insert(assistantContent, {type = "tool_use", id = toolId, name = toolName, input = input})
             table.insert(history, {role = "assistant", content = assistantContent})
 
             -- Tool result — truncate large results (e.g. read_file on a big file).
@@ -689,6 +683,15 @@ local function agentChat(userInput)
 
             pushLine("  ✓ done", C.grey)
             newContent()
+
+            toolIters = toolIters + 1
+            if toolIters >= MAX_TOOL_ITERS then
+                log("tool iteration cap reached (" .. MAX_TOOL_ITERS .. ")")
+                pushLine("Stopped: too many consecutive tool calls (" .. MAX_TOOL_ITERS .. "). Type to continue.", C.red)
+                newContent()
+                saveHistory()
+                return false
+            end
 
             sendWithPreflight()
             streamStart, streamBuf = nil, ""
