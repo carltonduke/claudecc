@@ -41,7 +41,10 @@ neoForge {
 
 dependencies {
     compileOnly("cc.tweaked:cc-tweaked-$mcVersion-common-api:$ccVersion")
-
+    // The full CC:Tweaked mod (NeoForge build). It carries neoforge.mods.toml, so
+    // ModDevGradle detects it as a mod and FML loads it in dev runs — satisfying the
+    // mandatory computercraft dependency. (compileOnly above keeps the jar API-only.)
+    runtimeOnly("cc.tweaked:cc-tweaked-$mcVersion-forge:$ccVersion")
 }
 
 tasks.jar {
