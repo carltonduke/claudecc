@@ -41,7 +41,7 @@ neoForge {
 
 dependencies {
     compileOnly("cc.tweaked:cc-tweaked-$mcVersion-common-api:$ccVersion")
-
+    runtimeOnly("cc.tweaked:cc-tweaked-$mcVersion-forge:$ccVersion")
 }
 
 tasks.jar {
