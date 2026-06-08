@@ -447,9 +447,43 @@ local function execTool(name, input)
         local path = input.path
         if not path            then return "Error: missing 'path' argument" end
         if not fs.exists(path) then return "Error: not found: " .. path end
-        local ok = shell.run(path)
-        return ok and "Program ran successfully." or
-            "Program stopped. If the user pressed Ctrl+T to terminate it intentionally, do not treat this as an error — ask whether they want to continue or make changes."
+
+        -- Run the program against an off-screen window so we can (a) capture its
+        -- printed output to feed back to Claude and (b) keep it from drawing over
+        -- the claude UI on the real terminal.
+        local w = term.getSize()
+        local BUF_H = 64                       -- retain up to 64 lines of output
+        local capture = window.create(term.current(), 1, 1, w, BUF_H, false)
+        local prev = term.redirect(capture)
+        local pcOk, shellRet = pcall(shell.run, path)
+        term.redirect(prev)
+
+        -- Scrape non-blank lines from the capture buffer.
+        local lines = {}
+        for y = 1, BUF_H do
+            local text = capture.getLine(y)
+            if text then table.insert(lines, (text:gsub("%s+$", ""))) end
+        end
+        while #lines > 0 and lines[#lines] == "" do table.remove(lines) end
+        local output = table.concat(lines, "\n")
+
+        local status
+        if not pcOk then
+            status = "Program crashed: " .. tostring(shellRet)
+        elseif shellRet then
+            status = "Program exited normally (no Lua error). This does NOT mean it " ..
+                "achieved its goal — read the output below to confirm."
+        else
+            status = "Program stopped (returned false / errored, or the user pressed " ..
+                "Ctrl+T to terminate it). If the user terminated it intentionally, do " ..
+                "not treat this as an error."
+        end
+
+        if output ~= "" then
+            return status .. "\n\n--- program output ---\n" .. output
+        else
+            return status .. "\n\n(no terminal output)"
+        end
 
     elseif name == "pastebin_put" then
         local path = input.path
