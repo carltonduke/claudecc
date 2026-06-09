@@ -9,7 +9,7 @@ displayName="CC: Claude"
 displayTest="IGNORE_ALL_VERSION"
 description='''
 Adds an interactive Claude AI chat shell to CC: Tweaked computers.
-Run /claudecc api <key> as an operator, then run the 'claude' program on any computer.
+Server admins grant the claudecc.use permission; players run /claudecc api <key> to set their own key, then run the 'claude' program on any computer.
 '''
 
 [[dependencies.claudecc]]

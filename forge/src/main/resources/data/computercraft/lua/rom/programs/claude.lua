@@ -5,8 +5,8 @@ if not claudecc then
     error("The claudecc API is not available on this computer.", 0)
 end
 
--- ─── Debug log (forge/run/saves/<world>/computercraft/computer/<id>/claude_debug.log) ─
-local _logFile = fs.open("claude_debug.log", "a")
+-- ─── Debug log (forge/run/saves/<world>/computercraft/computer/<id>/_chat.log) ─
+local _logFile = fs.open("_chat.log", "a")
 local function log(msg)
     if _logFile then
         _logFile.writeLine("[" .. os.clock() .. "] " .. tostring(msg))
@@ -46,6 +46,20 @@ local lastInputTokens    = 0
 local lastOutputTokens   = 0
 local lastRatelimitLeft  = -1   -- -1 = unknown
 local AUTO_COMPACT_THRESHOLD = 18000  -- auto-compact when input tokens exceed this
+local MAX_TOOL_ITERS = 25  -- cap consecutive tool calls in one turn (runaway-loop guard)
+
+-- ─── Prompt input history (Up/Down arrow recall) ─────────────────────────────
+-- Last few submitted inputs; Up/Down in the input bar cycles through them.
+local promptHistory = {}          -- oldest → newest
+local MAX_PROMPT_HISTORY = 5
+local function recordPrompt(text)
+    if not text or text == "" then return end
+    if promptHistory[#promptHistory] == text then return end  -- skip consecutive duplicate
+    promptHistory[#promptHistory + 1] = text
+    while #promptHistory > MAX_PROMPT_HISTORY do
+        table.remove(promptHistory, 1)
+    end
+end
 
 -- ─── Scroll buffer ────────────────────────────────────────────────────────────
 -- Each entry is a list of {text, colour} segments forming one screen line.
@@ -70,6 +84,14 @@ local function screenRowToBufLine(screenRow)
     return (li >= 1 and li <= total) and li or nil
 end
 
+-- Return the plain text of lineBuf[i] (all segment texts concatenated).
+local function lineText(i)
+    if not lineBuf[i] then return "" end
+    local t = {}
+    for _, seg in ipairs(lineBuf[i]) do t[#t+1] = seg[1] end
+    return table.concat(t)
+end
+
 -- Return the text of the current selection as a newline-joined string.
 local function getSelectedText()
     if not selA or not selB then return "" end
@@ -88,14 +110,6 @@ end
 -- Add one screen-width line (already wrapped) to the buffer.
 local function bufLine(segments)
     table.insert(lineBuf, segments)
-end
-
--- Return the plain text of lineBuf[i] (all segment texts concatenated).
-local function lineText(i)
-    if not lineBuf[i] then return "" end
-    local t = {}
-    for _, seg in ipairs(lineBuf[i]) do t[#t+1] = seg[1] end
-    return table.concat(t)
 end
 
 -- Render the chat viewport.
@@ -446,9 +460,43 @@ local function execTool(name, input)
         local path = input.path
         if not path            then return "Error: missing 'path' argument" end
         if not fs.exists(path) then return "Error: not found: " .. path end
-        local ok = shell.run(path)
-        return ok and "Program ran successfully." or
-            "Program stopped. If the user pressed Ctrl+T to terminate it intentionally, do not treat this as an error — ask whether they want to continue or make changes."
+
+        -- Run the program against an off-screen window so we can (a) capture its
+        -- printed output to feed back to Claude and (b) keep it from drawing over
+        -- the claude UI on the real terminal.
+        local w = term.getSize()
+        local BUF_H = 64                       -- retain up to 64 lines of output
+        local capture = window.create(term.current(), 1, 1, w, BUF_H, false)
+        local prev = term.redirect(capture)
+        local pcOk, shellRet = pcall(shell.run, path)
+        term.redirect(prev)
+
+        -- Scrape non-blank lines from the capture buffer.
+        local lines = {}
+        for y = 1, BUF_H do
+            local text = capture.getLine(y)
+            if text then table.insert(lines, (text:gsub("%s+$", ""))) end
+        end
+        while #lines > 0 and lines[#lines] == "" do table.remove(lines) end
+        local output = table.concat(lines, "\n")
+
+        local status
+        if not pcOk then
+            status = "Program crashed: " .. tostring(shellRet)
+        elseif shellRet then
+            status = "Program exited normally (no Lua error). This does NOT mean it " ..
+                "achieved its goal — read the output below to confirm."
+        else
+            status = "Program stopped (returned false / errored, or the user pressed " ..
+                "Ctrl+T to terminate it). If the user terminated it intentionally, do " ..
+                "not treat this as an error."
+        end
+
+        if output ~= "" then
+            return status .. "\n\n--- program output ---\n" .. output
+        else
+            return status .. "\n\n(no terminal output)"
+        end
 
     elseif name == "pastebin_put" then
         local path = input.path
@@ -507,7 +555,7 @@ local function buildSystemContext()
     return table.concat(lines, "\n")
 end
 
-local HISTORY_FILE = "claude_history.json"
+local HISTORY_FILE = "_chat_history.json"
 local MAX_HISTORY  = 60  -- max saved messages (not counting system context pair)
 
 local history = {
@@ -554,14 +602,42 @@ local function pushPlainText(text)
     if first then bufLine({}) end
 end
 
+local renderHeader   -- forward decl; defined below, called from agentChat
+local handleCompact  -- forward decl; defined below, called from sendWithPreflight
+
+-- Rough input-token estimate from serialised history (~4 chars/token avg).
+local function estimateInputTokens(hist)
+    return math.floor(#textutils.serialiseJSON(hist) / 4)
+end
+
+-- Wrapper around claudecc.ask that:
+--   1. Pre-flight estimates input tokens and compacts proactively if over the threshold,
+--      so a single oversized request can't blow past the per-minute rate limit.
+--   2. Refreshes the header indicator with the estimate immediately (the real value
+--      arrives later via claude_usage).
+local function sendWithPreflight()
+    local est = estimateInputTokens(history)
+    if est >= AUTO_COMPACT_THRESHOLD and #history > 4 then
+        pushBlank()
+        pushLine("↻ Pre-emptive compact (" .. est .. " est. input tokens)…", C.grey)
+        newContent()
+        handleCompact()
+        est = estimateInputTokens(history)  -- handleCompact rebuilt history
+    end
+    lastInputTokens = est
+    renderHeader()
+    claudecc.ask(textutils.serialiseJSON(history), TOOLS_JSON)
+end
+
 local function agentChat(userInput)
     log("user: " .. tostring(userInput))
     table.insert(history, {role = "user", content = userInput})
-    claudecc.ask(textutils.serialiseJSON(history), TOOLS_JSON)
+    sendWithPreflight()
     log("ask() sent")
 
     local streamStart = nil  -- lineBuf index where the streaming response begins
     local streamBuf   = ""   -- accumulated text received via claude_chunk
+    local toolIters   = 0    -- consecutive tool calls this turn (runaway-loop guard)
 
     local function finishStream()
         if streamStart then
@@ -585,6 +661,14 @@ local function agentChat(userInput)
             lastOutputTokens = b or 0
             lastRatelimitLeft = c or -1
             log("usage: in=" .. tostring(a) .. " out=" .. tostring(b) .. " remaining=" .. tostring(c))
+            renderHeader()
+
+        elseif ev == "claude_ratelimit" then
+            -- Sent by ClaudeAPI on non-200 responses so the rate-limit half of the
+            -- indicator stays current even after a failed request. lastInputTokens
+            -- is intentionally not touched here.
+            lastRatelimitLeft = a or -1
+            log("ratelimit (no usage): remaining=" .. tostring(a))
             renderHeader()
 
         elseif ev == "claude_chunk" then
@@ -623,23 +707,15 @@ local function agentChat(userInput)
             local result = execTool(toolName, input)
             log("tool result: " .. tostring(result and result:sub(1, 200) or "nil"))
 
-            -- Build assistant content array (text + tool_use).
-            -- Large string fields (e.g. write_file content) are replaced with a
-            -- path reference — the file is on disk so Claude can read_file it again.
-            local histInput = {}
-            for k, v in pairs(input) do
-                if type(v) == "string" and #v > 300 and k ~= "path" then
-                    histInput[k] = "(omitted — see " .. tostring(input.path or "file") .. ")"
-                else
-                    histInput[k] = v
-                end
-            end
-
+            -- Build assistant content array (text + tool_use). The tool_use input
+            -- must faithfully record what Claude actually sent — mutating it (e.g.
+            -- omitting a large write_file content) corrupts the transcript and makes
+            -- Claude distrust its own write and re-issue it endlessly.
             local assistantContent = {}
             if textBefore and textBefore ~= "" then
                 table.insert(assistantContent, {type = "text", text = textBefore})
             end
-            table.insert(assistantContent, {type = "tool_use", id = toolId, name = toolName, input = histInput})
+            table.insert(assistantContent, {type = "tool_use", id = toolId, name = toolName, input = input})
             table.insert(history, {role = "assistant", content = assistantContent})
 
             -- Tool result — truncate large results (e.g. read_file on a big file).
@@ -655,7 +731,16 @@ local function agentChat(userInput)
             pushLine("  ✓ done", C.grey)
             newContent()
 
-            claudecc.ask(textutils.serialiseJSON(history), TOOLS_JSON)
+            toolIters = toolIters + 1
+            if toolIters >= MAX_TOOL_ITERS then
+                log("tool iteration cap reached (" .. MAX_TOOL_ITERS .. ")")
+                pushLine("Stopped: too many consecutive tool calls (" .. MAX_TOOL_ITERS .. "). Type to continue.", C.red)
+                newContent()
+                saveHistory()
+                return false
+            end
+
+            sendWithPreflight()
             streamStart, streamBuf = nil, ""
 
         elseif ev == "claude_error" then
@@ -681,6 +766,9 @@ local function captureTyping(ta)
         local vw = w - 2
         if ta.pos <= scroll then scroll = ta.pos - 1
         elseif ta.pos > scroll + vw then scroll = ta.pos - vw end
+        -- Don't scroll past the end of the (possibly shrunken) buffer, which would
+        -- hide the remaining text and show a blank field after backspacing.
+        scroll = math.min(scroll, math.max(0, #ta.buf + 1 - vw))
     end
     local function redraw()
         term.setCursorPos(3, INPUT_ROW)
@@ -731,6 +819,8 @@ local function readline(initBuf, initPos)
     local pos         = initPos or (#buf + 1)
     local inputScroll = 0  -- chars scrolled off the left of the input view
     local ctrlHeld    = false
+    local navIdx      = nil   -- nil = editing live draft; else index into promptHistory
+    local savedDraft  = nil   -- live draft text saved before history navigation
 
     local function clampInputScroll()
         local visibleW = w - 2
@@ -739,6 +829,9 @@ local function readline(initBuf, initPos)
         elseif pos > inputScroll + visibleW then
             inputScroll = pos - visibleW
         end
+        -- Don't scroll past the end of the (possibly shrunken) buffer, which would
+        -- hide the remaining text and show a blank field after backspacing.
+        inputScroll = math.min(inputScroll, math.max(0, #buf + 1 - visibleW))
     end
 
     local function redrawInput()
@@ -833,6 +926,37 @@ local function readline(initBuf, initPos)
                 clampInputScroll()
                 redrawInput()
 
+            elseif p1 == keys.up then
+                -- Recall an older submitted prompt. Save the live draft on the
+                -- first step up so Down can return to it.
+                if #promptHistory > 0 then
+                    if navIdx == nil then
+                        savedDraft = buf
+                        navIdx = #promptHistory
+                    elseif navIdx > 1 then
+                        navIdx = navIdx - 1
+                    end
+                    buf = promptHistory[navIdx]
+                    pos = #buf + 1
+                    clampInputScroll()
+                    redrawInput()
+                end
+
+            elseif p1 == keys.down then
+                -- Move toward newer prompts; past the newest, restore the draft.
+                if navIdx ~= nil then
+                    navIdx = navIdx + 1
+                    if navIdx > #promptHistory then
+                        navIdx = nil
+                        buf = savedDraft or ""
+                    else
+                        buf = promptHistory[navIdx]
+                    end
+                    pos = #buf + 1
+                    clampInputScroll()
+                    redrawInput()
+                end
+
             elseif p1 == keys.pageUp then
                 scrollOff = math.min(scrollOff + CHAT_HEIGHT, math.max(0, #lineBuf - CHAT_HEIGHT))
                 renderChat()
@@ -888,7 +1012,7 @@ local function readline(initBuf, initPos)
 end
 
 -- ─── Header ───────────────────────────────────────────────────────────────────
-local function renderHeader()
+function renderHeader()
     term.setCursorPos(1, 1)
     bg(colours.black)
     col(C.cyan)
@@ -939,7 +1063,7 @@ local function handleClear()
     newContent()
 end
 
-local function handleCompact()
+function handleCompact()
     if #history <= 2 then
         pushLine("Nothing to compact yet.", C.grey)
         newContent()
@@ -1033,6 +1157,7 @@ local _ok, _err = xpcall(function()
 
         if input == nil then break end
         if input ~= "" then
+            recordPrompt(input)
             local cmd = input:match("^/(%S*)$")
             if cmd ~= nil then
                 local fn = COMMANDS[cmd:lower()]
