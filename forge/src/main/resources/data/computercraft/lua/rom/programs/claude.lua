@@ -48,6 +48,19 @@ local lastRatelimitLeft  = -1   -- -1 = unknown
 local AUTO_COMPACT_THRESHOLD = 18000  -- auto-compact when input tokens exceed this
 local MAX_TOOL_ITERS = 25  -- cap consecutive tool calls in one turn (runaway-loop guard)
 
+-- ─── Prompt input history (Up/Down arrow recall) ─────────────────────────────
+-- Last few submitted inputs; Up/Down in the input bar cycles through them.
+local promptHistory = {}          -- oldest → newest
+local MAX_PROMPT_HISTORY = 5
+local function recordPrompt(text)
+    if not text or text == "" then return end
+    if promptHistory[#promptHistory] == text then return end  -- skip consecutive duplicate
+    promptHistory[#promptHistory + 1] = text
+    while #promptHistory > MAX_PROMPT_HISTORY do
+        table.remove(promptHistory, 1)
+    end
+end
+
 -- ─── Scroll buffer ────────────────────────────────────────────────────────────
 -- Each entry is a list of {text, colour} segments forming one screen line.
 local lineBuf   = {}
@@ -806,6 +819,8 @@ local function readline(initBuf, initPos)
     local pos         = initPos or (#buf + 1)
     local inputScroll = 0  -- chars scrolled off the left of the input view
     local ctrlHeld    = false
+    local navIdx      = nil   -- nil = editing live draft; else index into promptHistory
+    local savedDraft  = nil   -- live draft text saved before history navigation
 
     local function clampInputScroll()
         local visibleW = w - 2
@@ -910,6 +925,37 @@ local function readline(initBuf, initPos)
                 pos = #buf + 1
                 clampInputScroll()
                 redrawInput()
+
+            elseif p1 == keys.up then
+                -- Recall an older submitted prompt. Save the live draft on the
+                -- first step up so Down can return to it.
+                if #promptHistory > 0 then
+                    if navIdx == nil then
+                        savedDraft = buf
+                        navIdx = #promptHistory
+                    elseif navIdx > 1 then
+                        navIdx = navIdx - 1
+                    end
+                    buf = promptHistory[navIdx]
+                    pos = #buf + 1
+                    clampInputScroll()
+                    redrawInput()
+                end
+
+            elseif p1 == keys.down then
+                -- Move toward newer prompts; past the newest, restore the draft.
+                if navIdx ~= nil then
+                    navIdx = navIdx + 1
+                    if navIdx > #promptHistory then
+                        navIdx = nil
+                        buf = savedDraft or ""
+                    else
+                        buf = promptHistory[navIdx]
+                    end
+                    pos = #buf + 1
+                    clampInputScroll()
+                    redrawInput()
+                end
 
             elseif p1 == keys.pageUp then
                 scrollOff = math.min(scrollOff + CHAT_HEIGHT, math.max(0, #lineBuf - CHAT_HEIGHT))
@@ -1111,6 +1157,7 @@ local _ok, _err = xpcall(function()
 
         if input == nil then break end
         if input ~= "" then
+            recordPrompt(input)
             local cmd = input:match("^/(%S*)$")
             if cmd ~= nil then
                 local fn = COMMANDS[cmd:lower()]
