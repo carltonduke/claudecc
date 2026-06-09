@@ -718,6 +718,9 @@ local function captureTyping(ta)
         local vw = w - 2
         if ta.pos <= scroll then scroll = ta.pos - 1
         elseif ta.pos > scroll + vw then scroll = ta.pos - vw end
+        -- Don't scroll past the end of the (possibly shrunken) buffer, which would
+        -- hide the remaining text and show a blank field after backspacing.
+        scroll = math.min(scroll, math.max(0, #ta.buf + 1 - vw))
     end
     local function redraw()
         term.setCursorPos(3, INPUT_ROW)
@@ -776,6 +779,9 @@ local function readline(initBuf, initPos)
         elseif pos > inputScroll + visibleW then
             inputScroll = pos - visibleW
         end
+        -- Don't scroll past the end of the (possibly shrunken) buffer, which would
+        -- hide the remaining text and show a blank field after backspacing.
+        inputScroll = math.min(inputScroll, math.max(0, #buf + 1 - visibleW))
     end
 
     local function redrawInput()
