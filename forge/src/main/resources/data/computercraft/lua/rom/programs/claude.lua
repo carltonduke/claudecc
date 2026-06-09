@@ -5,8 +5,8 @@ if not claudecc then
     error("The claudecc API is not available on this computer.", 0)
 end
 
--- ─── Debug log (forge/run/saves/<world>/computercraft/computer/<id>/claude_debug.log) ─
-local _logFile = fs.open("claude_debug.log", "a")
+-- ─── Debug log (forge/run/saves/<world>/computercraft/computer/<id>/_chat.log) ─
+local _logFile = fs.open("_chat.log", "a")
 local function log(msg)
     if _logFile then
         _logFile.writeLine("[" .. os.clock() .. "] " .. tostring(msg))
@@ -542,7 +542,7 @@ local function buildSystemContext()
     return table.concat(lines, "\n")
 end
 
-local HISTORY_FILE = "claude_history.json"
+local HISTORY_FILE = "_chat_history.json"
 local MAX_HISTORY  = 60  -- max saved messages (not counting system context pair)
 
 local history = {
