@@ -47,13 +47,16 @@ public class ClaudeAPI implements ILuaAPI {
      * <p>
      * On failure a {@code claude_error} event is queued with an error message as the second parameter.
      *
-     * @param args Arg 0: JSON-encoded messages array. Arg 1 (optional): JSON-encoded tools array.
+     * @param args Arg 0: JSON-encoded messages array. Arg 1 (optional): JSON-encoded tools array (may be
+     *             nil). Arg 2 (optional): live environment context, appended after the active player's
+     *             resolved system prompt (their custom one or the default).
      * @throws LuaException If required arguments are missing or have the wrong type.
      */
     @LuaFunction
     public final void ask(IArguments args) throws LuaException {
         var messagesJson = args.getString(0);
-        var toolsJson = args.count() > 1 ? args.getString(1) : null;
+        var toolsJson = args.count() > 1 && args.get(1) instanceof String t ? t : null;
+        var envContext = args.count() > 2 && args.get(2) instanceof String s ? s : null;
 
         var server = computer.getLevel().getServer();
         var activeUuid = ActiveUserTracker.getActive(computer.getID()).orElse(null);
@@ -80,6 +83,13 @@ public class ClaudeAPI implements ILuaAPI {
             return;
         }
 
+        // Resolve the system prompt: the active player's custom prompt (or the default), then the
+        // live environment context the Lua side supplied as arg 2.
+        var systemPrompt = ClaudeCommand.getSystemPrompt(server, activeUuid);
+        if (envContext != null && !envContext.isEmpty()) {
+            systemPrompt = systemPrompt + "\n\n" + envContext;
+        }
+
         var bodyBuilder = new StringBuilder();
         bodyBuilder.append("{\"model\":\"").append(MODEL)
             .append("\",\"stream\":true")
@@ -87,6 +97,9 @@ public class ClaudeAPI implements ILuaAPI {
             .append(",\"messages\":").append(messagesJson);
         if (toolsJson != null) {
             bodyBuilder.append(",\"tools\":").append(toolsJson);
+        }
+        if (!systemPrompt.isEmpty()) {
+            bodyBuilder.append(",\"system\":").append(new com.google.gson.JsonPrimitive(systemPrompt));
         }
         bodyBuilder.append("}");
 

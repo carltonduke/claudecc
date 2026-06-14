@@ -555,20 +555,22 @@ local function buildSystemContext()
     return table.concat(lines, "\n")
 end
 
+-- Live environment context (computer ID, peripherals, API hints), passed to the Java
+-- side as claudecc.ask's 3rd argument. The behavioural system prompt itself — the
+-- default, or the player's `/claudecc system_prompt` override — is resolved server-side
+-- in ClaudeCommand.getSystemPrompt and prepended there. Message history stays purely
+-- conversational (no faked system-context message pair).
+local ENV_CONTEXT = buildSystemContext()
+
 local HISTORY_FILE = "_chat_history.json"
-local MAX_HISTORY  = 60  -- max saved messages (not counting system context pair)
+local MAX_HISTORY  = 60  -- max saved messages
 
-local history = {
-    {role = "user",      content = buildSystemContext()},
-    {role = "assistant", content = "Understood. I know my environment and am ready to help."},
-}
+local history = {}
 
--- Save everything after the system context pair.
+-- Persist the full conversation history (the system prompt + env context are sent out-of-band, not here).
 local function saveHistory()
-    local toSave = {}
-    for i = 3, #history do toSave[#toSave+1] = history[i] end
     local f = fs.open(HISTORY_FILE, "w")
-    if f then f.write(textutils.serialiseJSON(toSave)); f.close() end
+    if f then f.write(textutils.serialiseJSON(history)); f.close() end
 end
 
 -- Load saved history into history table; returns number of messages loaded.
@@ -605,9 +607,9 @@ end
 local renderHeader   -- forward decl; defined below, called from agentChat
 local handleCompact  -- forward decl; defined below, called from sendWithPreflight
 
--- Rough input-token estimate from serialised history (~4 chars/token avg).
+-- Rough input-token estimate from serialised history + system prompt (~4 chars/token avg).
 local function estimateInputTokens(hist)
-    return math.floor(#textutils.serialiseJSON(hist) / 4)
+    return math.floor((#textutils.serialiseJSON(hist) + #ENV_CONTEXT) / 4)
 end
 
 -- Wrapper around claudecc.ask that:
@@ -626,7 +628,7 @@ local function sendWithPreflight()
     end
     lastInputTokens = est
     renderHeader()
-    claudecc.ask(textutils.serialiseJSON(history), TOOLS_JSON)
+    claudecc.ask(textutils.serialiseJSON(history), TOOLS_JSON, ENV_CONTEXT)
 end
 
 local function agentChat(userInput)
@@ -1048,10 +1050,7 @@ end
 
 -- ─── Slash commands ──────────────────────────────────────────────────────────
 local function handleClear()
-    history = {
-        {role = "user",      content = buildSystemContext()},
-        {role = "assistant", content = "Understood. I know my environment and am ready to help."},
-    }
+    history = {}
     saveHistory()
     lineBuf = {}
     scrollOff = 0
@@ -1064,7 +1063,7 @@ local function handleClear()
 end
 
 function handleCompact()
-    if #history <= 2 then
+    if #history == 0 then
         pushLine("Nothing to compact yet.", C.grey)
         newContent()
         return
@@ -1082,7 +1081,7 @@ function handleCompact()
                   "Capture key facts about this computer, tasks completed, outcomes, " ..
                   "and anything needed to continue naturally. Be concise.",
     }
-    claudecc.ask(textutils.serialiseJSON(req))  -- no tools arg
+    claudecc.ask(textutils.serialiseJSON(req), nil, ENV_CONTEXT)  -- no tools arg
 
     local summary, summaryBuf = nil, ""
     while true do
@@ -1104,8 +1103,6 @@ function handleCompact()
 
     local before = #history
     history = {
-        {role = "user",      content = buildSystemContext()},
-        {role = "assistant", content = "Understood. I know my environment and am ready to help."},
         {role = "user",      content = "[Conversation summary]: " .. summary},
         {role = "assistant", content = "Got it, I have the context from our previous conversation."},
     }
@@ -1113,7 +1110,7 @@ function handleCompact()
 
     -- Replace the "Compacting..." line with the result
     if lineBuf[#lineBuf] then table.remove(lineBuf) end
-    pushLine("✓ Compacted " .. (before - 2) .. " messages into summary.", C.grey)
+    pushLine("✓ Compacted " .. before .. " messages into summary.", C.grey)
     newContent()
 end
 
