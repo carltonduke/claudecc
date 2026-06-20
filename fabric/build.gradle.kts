@@ -3,7 +3,7 @@ plugins {
 }
 
 base {
-    archivesName = "claudecc-forge"
+    archivesName = "claudecc-fabric"
 }
 
 val mcVersion: String by extra
