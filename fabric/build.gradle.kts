@@ -2,6 +2,10 @@ plugins {
     id("fabric-loom") version "1.16.1"
 }
 
+base {
+    archivesName = "claudecc-forge"
+}
+
 val mcVersion: String by extra
 val fabricLoaderVersion: String by extra
 val fabricApiVersion: String by extra
